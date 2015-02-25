@@ -1,0 +1,494 @@
+#!/usr/bin/env python
+#
+#    Ansible module for working with Vagrant
+#    Copyright (C) 2015  Philip Marc Schwartz <philip@progmad.com>
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+#
+#
+# TODO(pschwartz)
+#
+# - Add more VM option
+#   - Networking (Type/Quantity)
+#   - Memory
+#   - CPU
+#   - custome modification commads.
+# - Better bulk Vagrantfile creation.
+# - Make VagrantState interface better to remove direct access to data{}
+#   - Better internal instance counter
+#   - Setters and Getters for instance/instances (not a fan for func access)
+# - Internalize Vagrantfile globals to Vagrantfile class.
+#
+# - move vagrant files to a cache directory with subdirectories to make
+#   vagrant calls use separate vagrant processes (how will this affect
+#   networking?)
+
+DOCUMENTATION = '''
+---
+module: vagrant
+short_description: Generate virtual machines with Vagrant
+description:
+  - allows the management of the full cycle of virtualization with vagrant
+version_added: ""
+options:
+  state:
+    description:
+      - Indicate desired state of the resource
+    choices:
+      - present
+      - absent
+    default: present
+  cmd:
+    description:
+      - Vagrant action to preform
+    choices:
+      - status
+      - up
+      - info
+      - halt
+      - destroy
+    default: null
+    aliases:
+      - command
+  box_name:
+    description:
+      - Name of box to use
+    aliases:
+      - image
+  box_path:
+    description:
+      - Path to box
+  vm_name:
+    description:
+      - Name to use for VM
+  forward_ports:
+    description:
+      - List of ports to forward to host system
+    default: []
+  gui:
+    description:
+      - Set GUI mode
+    choices:
+      - true
+      - false
+    default: false
+  mem:
+    description:
+      - Amount of ram to give VM
+    default: 512
+  cpu:
+    description:
+      - CPU count to give VM
+    default: 1
+author: Philip Marc Schwartz
+notes:
+  - Current can only setup 1 Vagrantfile per top level playbook directory
+  - Current only supports VirtualBox
+'''
+
+EXAMPLES = '''
+- name: "Create Vagrant Instance."
+  vagrant:
+    state: present
+    box_name: "coreos-alpha"
+    box_path: "http://alpha.release.core-os.net/amd64-usr/584.0.0/coreos_production_vagrant.box"
+    vm_name: "core01"
+    mem: "2048"
+    cpu: "2"
+
+- name: "Get Vagrant Instance Facts."
+  vagrant:
+    cmd: info
+    vm_name: "core01"
+'''
+
+VAGRANT_FILE = "./Vagrantfile"
+VAGRANT_DICT_FILE = "./cache/.Vagrantfile.json"
+VAGRANT_LOCKFILE = "./cache/.vagrant"
+VAGRANT_DATA_DIR = "./.vagrant"
+
+INT_IP = "192.168.179.{oct}"
+
+HEADER = "Vagrant.configure('2') do |config|"
+
+VM = """
+  config.vm.define :{name} do |{name}_config|
+    {name}_config.vm.network :private_network, ip: "{ip}"
+    {name}_config.vm.box = "{box_name}"
+    {name}_config.vm.host_name = "{rname}"
+    {name}_config.vm.provider :virtualbox do |vb|
+      vb.customize ['modifyvm', :id, '--nicpromisc1', 'allow-all']
+      vb.customize ['modifyvm', :id, '--nicpromisc2', 'allow-all']
+      {gui}
+      {mem}
+      {cpu}
+    end
+    {port_fwd}
+  end
+
+"""
+TAIL = "end"
+
+PORT_FORWARD = "    {name}_config.vm.forward_port {port}, {port}"
+VM_GUI = "vb.gui = {gui}"
+VM_MEM = "vb.memory = {mem}"
+VM_CPU = "vb.cpus = {cpu}"
+
+import json
+import os.path
+import shutil
+import subprocess
+import sys
+
+try:
+    import lockfile
+except ImportError:
+    print "Python module lockfile is not installed. Falling back to using" \
+          "flock(), which will fail on Windows."
+
+try:
+    import vagrant
+except ImportError:
+    print "failed=True msg='python-vagrant required for this module'"
+    sys.exit(1)
+
+
+class VagrantState(object):
+    def __init__(self, _gui, _mem, _cpu):
+        self._gui = _gui
+        self._mem = _mem
+        self._cpu = _cpu
+
+        self.data = dict(num_inst=0, instances={})
+
+        self._deserialize()
+        self._serialize()
+
+    def _instances(self):
+        return self.data['instances']
+
+    def _serialize(self):
+        self._save()
+        self._write()
+
+    def _deserialize(self):
+        if os.path.isfile(VAGRANT_DICT_FILE):
+            with open(VAGRANT_DICT_FILE) as f:
+                self.data = json.load(f)
+
+    def _save(self):
+        with open(VAGRANT_DICT_FILE, 'w') as f:
+            json.dump(self.data, f, sort_keys=True, indent=4,
+                      separators=(',', ': '))
+
+    def _write(self):
+        gui = ""
+
+        with open(VAGRANT_FILE, 'w') as f:
+            f.write(HEADER)
+
+            instances = self._instances()
+            for vm_name in instances.keys():
+                instance = instances[vm_name]
+                name = instance['vagrant_name']
+                rname = name.replace('_', '-')
+                ip = instance['internal_ip']
+                box_name = instance['box_name']
+
+                if self._gui:
+                    gui = VM_GUI.format(gui=self._gui)
+
+                mem = VM_MEM.format(mem=self._mem)
+                cpu = VM_CPU.format(cpu=self._cpu)
+
+                if 'forward_ports' in instance:
+                    ports = []
+                    for port in instance['forward_ports']:
+                        ports.append(PORT_FORWARD.format(name=name, port=port))
+
+                port_fwd = "\n".join(ports)
+
+                f.write(VM.format(name=name, rname=rname, ip=ip,
+                                  box_name=box_name, port_fwd=port_fwd,
+                                  gui=gui, mem=mem, cpu=cpu))
+            f.write(TAIL)
+
+    def _instance(self, vm_name):
+        instances = self._instances()
+
+        if vm_name in instances:
+            return instances[vm_name]
+
+        instance = dict()
+        num_inst = self.data['num_inst'] + 1
+        instance['name'] = vm_name
+        instance['vagrant_name'] = vm_name.replace('-', '_')
+        instance['internal_ip'] = INT_IP.format(oct=(255-num_inst))
+        instance['forward_ports'] = []
+        self.data['num_inst'] = num_inst
+
+        instances[vm_name] = instance
+
+        return instances[vm_name]
+
+    def _remove(self, vm_name):
+        instances = self._instances()
+
+        if vm_name in instances:
+            instances.pop(vm_name)
+            self.data['num_inst'] -= 1
+
+    def _clean(self):
+        if self.data['num_inst'] == 0:
+            if os.path.isfile(VAGRANT_FILE):
+                os.remove(VAGRANT_FILE)
+            if os.path.isfile(VAGRANT_DICT_FILE):
+                os.remove(VAGRANT_DICT_FILE)
+            if os.path.isdir(VAGRANT_DATA_DIR):
+                shutil.rmtree(VAGRANT_DATA_DIR)
+
+
+
+class VagrantWrapper(object):
+
+    def __init__(self, gui, mem, cpu):
+        self.lock = None
+
+        try:
+            self.lock = lockfile.FileLock(VAGRANT_LOCKFILE)
+            self.lock.acquire()
+        except:
+            try:
+                import fcntl
+                self.lock = open(VAGRANT_LOCKFILE, 'w')
+                fcntl.flock(self.lock, fcntl.LOCK_EX)
+            except:
+                print "failed=True msg='Could not get a lock for using" \
+                      "vagrant. Install python module \"lockfile\" to use" \
+                      "vagrant on non-POSIX filesytems.'"
+                sys.exit(1)
+
+        self.vg = vagrant.Vagrant()
+        self.vs = VagrantState(gui, mem, cpu)
+
+        self.vs._deserialize()
+        self.vs._serialize()
+
+    def __del__(self):
+        try:
+            self.lock.release()
+        except:
+            os.close(self.lock)
+        finally:
+            os.unlink(self.lock)
+
+    def _instance_to_ansible(self, vm_name):
+        instances = self.vs._instances()
+
+        if vm_name not in instances:
+            return None
+
+        instance = instances[vm_name]
+
+        config = self.vg.conf(None, instance['vagrant_name'])
+        hld_instance = {}
+        if config is not None:
+            hld_instance['name'] = vm_name
+            hld_instance['vagrant_name'] = instance['vagrant_name']
+            hld_instance['id'] = config['Host']
+            hld_instance['public_ip'] = config['HostName']
+            hld_instance['internal_ip'] = instance['internal_ip']
+            hld_instance['public_dns_name'] = config['HostName']
+            hld_instance['port'] = config['Port']
+            hld_instance['username'] = config['User']
+            hld_instance['key'] = config['IdentityFile']
+            hld_instance['status'] = self.vg.status(instance['vagrant_name'])
+
+        return [hld_instance]
+
+    def _instance_ansible_facts(self, vm_name):
+
+        instances = self.vs._instances()
+
+        ansible_facts = {}
+        if vm_name not in instances:
+            return ansible_facts
+
+        instance = instances[vm_name]
+        config = self.vg.conf(None, instance['vagrant_name'])
+        if config is not None:
+            ansible_facts['ansible_ssh_host'] = config['HostName']
+            ansible_facts['ansible_ssh_port'] = config['Port']
+            ansible_facts['ansible_ssh_private_key_file'] = config[
+                'IdentityFile']
+
+        return ansible_facts
+
+    def add_box(self, box_name, box_path):
+        if box_name is None or box_path is None:
+            raise Exception("box_name and box_path are required.")
+
+        changed = False
+        found = False
+
+        boxes = self.vg.box_list()
+        for box in boxes:
+            if box.name == box_name:
+                found = True
+                break
+
+        if not found:
+            self.vg.box_add(box_name, box_path)
+            changed = True
+
+        return changed
+
+    def status(self, vm_name):
+        status = {}
+
+        instances = self.vs._instances()
+        if vm_name in instances:
+            instance = instances[vm_name]
+            status[instance['vagrant_name']] = self.vg.status(
+                instance['vagrant_name'])
+
+        return (False, status)
+
+    def up(self, box_name, box_path, vm_name, forward_ports):
+        changed = self.add_box(box_name, box_path)
+
+        self.vs._deserialize()
+        instance = self.vs._instance(vm_name)
+
+        if 'box_name' not in instance:
+            instance['box_name'] = box_name
+
+        instance['forward_ports'] = forward_ports
+
+        self.vs._instances()[vm_name] = instance
+        self.vs._serialize()
+
+        if self.vg.status(instance['vagrant_name']) != 'running':
+            self.vg.up(False, vm_name=instance['vagrant_name'])
+            changed = True
+
+        return (changed, self._instance_to_ansible(vm_name),
+                self._instance_ansible_facts(vm_name))
+
+    def info(self, vm_name):
+        configs = {}
+
+        instances = self.vs._instances()
+        if vm_name in instances:
+            instance = instances[vm_name]
+            configs[vm_name] = self.vg.conf(None, instance['vagrant_name'])
+
+        return (False, self._instance_to_ansible(vm_name),
+                self._instance_ansible_facts(vm_name))
+
+    def halt(self, vm_name):
+        changed = False
+        status = {}
+
+        instances = self.vs._instance(vm_name)
+
+        if vm_name in instances:
+            instance = instances[vm_name]
+            if self.vg.status(instance['vagrant_name']) == 'running':
+                self.vg.halt(instance['vagrant_name'])
+            status[vm_name] = self.vg.status(instance['vagrant_name'])
+
+        return (changed, status)
+
+    def destroy(self, vm_name):
+        changed = False
+
+        instances = self.vs._instances()
+        if vm_name in instances:
+            instance = instances[vm_name]
+            (changed, status) = self.halt(vm_name)
+            self.vg.destroy(instance['vagrant_name'])
+            self.vs._remove(vm_name)
+            self.vs._serialize()
+            changed = True
+
+        self.vs._clean()
+        return changed
+
+
+def main():
+    module = AnsibleModule(
+        argument_spec=dict(
+            state=dict(choices=['present', 'absent']),
+            cmd=dict(required=False, aliases=['command'],
+                     choices=['status', 'up', 'info', 'halt', 'destroy']),
+            box_name=dict(aliases=['image']),
+            box_path=dict(),
+            vm_name=dict(required=True),
+            forward_ports=dict(default=[], type='list'),
+            gui=dict(default='false', choices=['true', 'false']),
+            mem=dict(default=512),
+            cpu=dict(default=1)
+        )
+    )
+
+    try:
+        state = module.params.get('state')
+        cmd = module.params.get('cmd')
+        box_name = module.params.get('box_name')
+        box_path = module.params.get('box_path')
+        vm_name = module.params.get('vm_name').split('.')[0]
+        forward_ports = module.params.get('forward_ports')
+        gui = module.params.get('gui')
+        mem = module.params.get('mem')
+        cpu = module.params.get('cpu')
+
+        vgw = VagrantWrapper(gui, mem, cpu)
+
+        if state is not None:
+            if state == 'present':
+                changed, instances, facts = vgw.up(box_name, box_path, vm_name,
+                                                   forward_ports)
+                module.exit_json(changed=changed, instances=instances,
+                                 ansible_facts=facts)
+            elif state == 'absent':
+                changed = vgw.destroy(vm_name)
+                module.exit_json(changed=changed, status=vgw.status(vm_name))
+        else:
+            if cmd == 'status':
+                changed, status = vgw.status(vm_name)
+                module.exit_json(changed=changed, status=status)
+            elif cmd == 'up':
+                changed, instances, facts = vgw.up(box_name, box_path, vm_name,
+                                                   forward_ports)
+                module.exit_json(changed=changed, instances=instances,
+                                 ansible_facts=facts)
+            elif cmd == 'info':
+                changed, instances, facts = vgw.info(vm_name)
+                module.exit_json(changed=changed, instances=instances,
+                                 ansible_facts=facts)
+            elif cmd == 'halt':
+                changed, status = vgw.halt(vm_name)
+                module.exit_json(changed=changed, status=status)
+            elif cmd == 'destroy':
+                changed = vgw.destroy(vm_name)
+                module.exit_json(changed=changed, status=vgw.status(vm_name))
+
+    except subprocess.CalledProcessError as e:
+        module.fail_json(msg="Vagrant command failed: %s." % (e))
+    module.exit_json(status="success")
+
+#<<INCLUDE_ANSIBLE_MODULE_COMMON>>
+main()
